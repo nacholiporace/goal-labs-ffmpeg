@@ -1,0 +1,435 @@
+# (Plan 49, fase 1) FFmpeg LGPL propio para Windows x64.
+#
+# Reemplaza al build `win64-lgpl-shared` de BtbN, que no es LGPL de verdad
+# (enlaza chromaprint con FFTW, GPL, dentro de avformat). Compila ffmpeg y
+# ffprobe desde el tarball oficial de ffmpeg.org con MSYS2 (MINGW64), sin GPL
+# ni nonfree, con --disable-autodetect y solo lo que usa la app:
+#   - codificadores: h264_nvenc (encabezados ffnvcodec, MIT), h264_qsv (libvpl),
+#     h264_amf (encabezados AMF, MIT), h264_mf (Media Foundation de Windows),
+#     libopenh264 (BSD-2) y aac (nativo);
+#   - decodificadores nativos (H.264, HEVC, VP9, MPEG-4, MJPEG, PNG...) y AV1
+#     por libdav1d (BSD-2);
+#   - dshow y lavfi como entrada, https por Schannel (TLS de Windows, sin
+#     OpenSSL), zlib para PNG y Matroska comprimido.
+# Ninguna de esas bibliotecas está en EXTERNAL_LIBRARY_VERSION3_LIST del
+# configure, así que el build queda LGPL 2.1 o posterior (sin --enable-version3).
+#
+# Lleva shared: los dos .exe chicos comparten las DLL de FFmpeg, más las DLL de
+# las bibliotecas externas y las de ejecución de MinGW (libwinpthread, libgcc,
+# libstdc++, según lo que pida cada una). Todas van al instalador y todas se
+# firman (fase 4). Verifica lo mismo que scripts/fetchFfmpeg.mjs, con el PATH
+# reducido a la carpeta del build y a Windows, así una DLL que falte se nota acá.
+# Solo se corre a mano (Actions → "FFmpeg Windows (LGPL)" → Run workflow):
+#   gh workflow run ffmpeg-windows.yml -f ffmpeg_version=9.0.2
+#
+# Después de correrlo:
+# 1. Bajar el artifact `ffmpeg-<versión>-win64-lgpl-shared` (trae el zip, su
+#    .sha256 y el zip con el código fuente de FFmpeg y de las bibliotecas):
+#      gh run download <id> --name ffmpeg-<versión>-win64-lgpl-shared
+# 2. Publicarlo en goal-labs-ffmpeg, en el mismo release que el de Mac
+#    (tag ffmpeg-<versión>). Si el release todavía no existe:
+#      gh release create ffmpeg-<versión> --repo nacholiporace/goal-labs-ffmpeg \
+#        --title "FFmpeg <versión> (LGPL) para Goal Labs" \
+#        --notes "Builds LGPL de FFmpeg que lleva Goal Labs. Windows: .github/workflows/ffmpeg-windows.yml; Mac: ffmpeg-mac.yml." \
+#        ffmpeg-<versión>-win64-lgpl-shared.zip ffmpeg-<versión>-win64-lgpl-shared.zip.sha256 \
+#        ffmpeg-<versión>-win64-sources.zip
+#    Si ya existe (lo creó el de Mac), subir los tres archivos con
+#      gh release upload ffmpeg-<versión> --repo nacholiporace/goal-labs-ffmpeg <los tres archivos>
+# 3. En scripts/fetchFfmpeg.mjs, WIN_GOAL_LABS: pegar `sha256` (el del .sha256);
+#    `tag` y `asset` ya siguen este esquema. Con el SHA-256 puesto, PINNED
+#    pasa a usar este build en vez del de BtbN. `npm run ffmpeg:fetch -- --force`
+#    lo baja y lo verifica.
+#
+# La versión tiene que ser la misma que FFMPEG_VERSION de scripts/fetchFfmpeg.mjs.
+name: FFmpeg Windows (LGPL)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_version:
+        description: Versión de FFmpeg (la misma que FFMPEG_VERSION en scripts/fetchFfmpeg.mjs)
+        required: true
+        default: '9.0.2'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 150
+    env:
+      FFMPEG_VERSION: ${{ inputs.ffmpeg_version }}
+      NAME: ffmpeg-${{ inputs.ffmpeg_version }}-win64-lgpl-shared
+      # Bibliotecas externas que se enlazan (paquetes de MSYS2 sin el prefijo
+      # mingw-w64-x86_64-). Los encabezados de NVIDIA y AMD no dejan DLL pero
+      # se compilan adentro: van igual a SOURCES.md.
+      EXTERNAL_PACKAGES: dav1d openh264 libvpl zlib ffnvcodec-headers amf-headers
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Instalar MSYS2 (MINGW64) y las bibliotecas
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            make
+            diffutils
+            tar
+            xz
+            zstd
+            zip
+            unzip
+            curl
+            gnupg
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-nasm
+            mingw-w64-x86_64-dav1d
+            mingw-w64-x86_64-openh264
+            mingw-w64-x86_64-libvpl
+            mingw-w64-x86_64-amf-headers
+            mingw-w64-x86_64-ffnvcodec-headers
+            mingw-w64-x86_64-zlib
+
+      - name: Bajar el código fuente y verificar la firma
+        run: |
+          set -euo pipefail
+          mkdir -p src && cd src
+          curl -fsSLO "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
+          curl -fsSLO "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz.asc"
+          curl -fsSL https://ffmpeg.org/ffmpeg-devel.asc | gpg --batch --import
+          gpg --batch --verify "ffmpeg-${FFMPEG_VERSION}.tar.xz.asc" "ffmpeg-${FFMPEG_VERSION}.tar.xz"
+          sha256sum "ffmpeg-${FFMPEG_VERSION}.tar.xz" | tee "ffmpeg-${FFMPEG_VERSION}.tar.xz.sha256"
+          tar -xf "ffmpeg-${FFMPEG_VERSION}.tar.xz"
+
+      - name: Compilar (LGPL 2.1, shared, solo lo que usa la app)
+        run: |
+          set -euo pipefail
+          W="$(cygpath -u "$GITHUB_WORKSPACE")"
+          cd "src/ffmpeg-${FFMPEG_VERSION}"
+          # --disable-autodetect: que no tome nada que no se pidió (iconv, lzma,
+          # bzlib, SDL2, Vulkan...). Lo que se pide a mano y no se encuentra hace
+          # fallar el configure ("requested but not found"), no se apaga callado.
+          ./configure \
+            --prefix="$W/prefix" \
+            --disable-gpl --disable-nonfree \
+            --disable-doc --disable-debug --disable-ffplay \
+            --enable-shared --disable-static \
+            --disable-autodetect \
+            --enable-w32threads \
+            --enable-mediafoundation --enable-schannel --enable-zlib \
+            --enable-dxva2 --enable-d3d11va \
+            --enable-ffnvcodec --enable-nvenc --enable-amf --enable-libvpl \
+            --enable-libopenh264 --enable-libdav1d \
+            || { tail -n 80 ffbuild/config.log; exit 1; }
+          if grep -q 'define CONFIG_VERSION3 1' config.h; then
+            echo '::error::el build quedó con version3 (LGPL v3); revisar qué biblioteca lo pidió'; exit 1
+          fi
+          make -j"$(nproc)"
+          make install
+
+      - name: Juntar los .exe y todas las DLL que necesitan
+        run: |
+          set -euo pipefail
+          W="$(cygpath -u "$GITHUB_WORKSPACE")"
+          DIST="$W/dist"
+          DATA="$W/data"
+          mkdir -p "$DIST" "$DATA/pkginfo"
+          cp "$W/prefix/bin/ffmpeg.exe" "$W/prefix/bin/ffprobe.exe" "$W"/prefix/bin/*.dll "$DIST/"
+          # ldd lista lo que carga cada .exe/.dll; lo que viene de /mingw64/bin se
+          # copia y se repite hasta que no aparezca nada nuevo.
+          while :; do
+            NEW=0
+            for f in "$DIST"/*.exe "$DIST"/*.dll; do
+              for dep in $(ldd "$f" | awk '$3 ~ "^/mingw64/bin/" {print $3}'); do
+                b="$(basename "$dep")"
+                if [ ! -f "$DIST/$b" ]; then cp "$dep" "$DIST/"; NEW=1; fi
+              done
+            done
+            [ "$NEW" = 0 ] && break
+          done
+          # Nada fuera de la carpeta y de Windows (ni msys-2.0.dll ni /mingw64).
+          DISTW="$(cd "$DIST" && pwd)"
+          BAD=0
+          for f in "$DIST"/*.exe "$DIST"/*.dll; do
+            while read -r line; do
+              echo "::error::$(basename "$f") carga $line"; BAD=1
+            done < <(ldd "$f" | awk '{print $3}' | grep -v '^$' | grep -viE "^(/c/windows/|${DISTW})" || true)
+          done
+          [ "$BAD" = 0 ] || exit 1
+          # Qué paquete de MSYS2 trae cada DLL de afuera (para SOURCES.md).
+          : > "$DATA/dlls.tsv"
+          for f in "$DIST"/*.dll; do
+            b="$(basename "$f")"
+            if [ -f "/mingw64/bin/$b" ]; then
+              echo -e "$b\t$(pacman -Qqo "/mingw64/bin/$b")" >> "$DATA/dlls.tsv"
+            else
+              echo -e "$b\tffmpeg" >> "$DATA/dlls.tsv"
+            fi
+          done
+          # Paquetes a documentar: los que traen DLL más los de EXTERNAL_PACKAGES.
+          { cut -f2 "$DATA/dlls.tsv" | grep -v '^ffmpeg$'
+            for p in $EXTERNAL_PACKAGES; do echo "mingw-w64-x86_64-$p"; done; } | sort -u > "$DATA/packages.txt"
+          mkdir -p "$W/stage/$NAME/licenses"
+          while read -r pkg; do
+            pacman -Qi "$pkg" > "$DATA/pkginfo/$pkg.txt"
+            # Los archivos de licencia que trae el paquete (share/licenses/...).
+            short="${pkg#mingw-w64-x86_64-}"
+            for lf in $(pacman -Qlq "$pkg" | grep '^/mingw64/share/licenses/.*[^/]$' || true); do
+              mkdir -p "$W/stage/$NAME/licenses/$short"
+              cp "$lf" "$W/stage/$NAME/licenses/$short/"
+            done
+          done < "$DATA/packages.txt"
+          gcc --version | sed -n 1p > "$DATA/gcc.txt"
+          ls -la "$DIST"
+          cat "$DATA/dlls.tsv"
+
+      - name: Verificar
+        run: |
+          set -euo pipefail
+          W="$(cygpath -u "$GITHUB_WORKSPACE")"
+          DIST="$W/dist"
+          DATA="$W/data"
+          # PATH mínimo: la carpeta del build y Windows. Si falta una DLL, falla acá.
+          ff() { PATH="$DIST:/c/Windows/System32:/c/Windows" "$DIST/ffmpeg.exe" -hide_banner "$@"; }
+          fp() { PATH="$DIST:/c/Windows/System32:/c/Windows" "$DIST/ffprobe.exe" -hide_banner "$@"; }
+          ff -version | tr -d '\r' | tee "$DATA/version.txt"
+          for flag in --enable-gpl --enable-nonfree --enable-libx264 --enable-libx265 --enable-version3; do
+            if grep -q -- "$flag" "$DATA/version.txt"; then echo "::error::la configuración tiene $flag"; exit 1; fi
+          done
+          ff -L | tr -d '\r' > "$DATA/license.txt"
+          tr '\n' ' ' < "$DATA/license.txt" | grep -q 'GNU Lesser General Public License' || { echo '::error::ffmpeg -L no dice LGPL'; exit 1; }
+          grep -q 'version 2.1 of the License' "$DATA/license.txt" || { echo '::error::ffmpeg -L no dice LGPL 2.1'; exit 1; }
+
+          ff -encoders | tr -d '\r' > "$DATA/encoders.txt"
+          for e in h264_nvenc h264_qsv h264_amf h264_mf libopenh264 aac; do
+            grep -qE "^ [VAS][.F][.S][.X][.B][.D] $e " "$DATA/encoders.txt" || { echo "::error::falta el codificador $e"; exit 1; }
+          done
+          if grep -qE ' libx26[45] ' "$DATA/encoders.txt"; then echo '::error::trae libx264/libx265'; exit 1; fi
+          DEC="$(ff -decoders | tr -d '\r')"
+          for d in h264 hevc vp9 mpeg4 mjpeg png aac libdav1d; do
+            echo "$DEC" | grep -qE "^ [VAS][.F][.S][.X][.B][.D] $d " || { echo "::error::falta el decodificador $d"; exit 1; }
+          done
+          DEV="$(ff -devices | tr -d '\r')"
+          for d in dshow lavfi; do
+            echo "$DEV" | grep -qE "^ [D ][E ] $d " || { echo "::error::falta el dispositivo $d"; exit 1; }
+          done
+          # Los filtros que usa la app (electron/) más ssim y psnr (benchEncoders).
+          FIL="$(ff -filters | tr -d '\r')"
+          for f in scale crop overlay concat fps format setpts setsar trim pad split null select showinfo \
+                   highpass color anullsrc testsrc2 sine ssim psnr; do
+            echo "$FIL" | grep -qE "^ [T.][S.] $f " || { echo "::error::falta el filtro $f"; exit 1; }
+          done
+          MUX="$(ff -muxers | tr -d '\r')"
+          for m in mp4 mov hls segment tee f32le null; do
+            echo "$MUX" | grep -qE "^ [D ]E[d ] ([A-Za-z0-9_]+,)*$m(,[A-Za-z0-9_]+)* " || { echo "::error::falta el formato de salida $m"; exit 1; }
+          done
+          DMX="$(ff -demuxers | tr -d '\r')"
+          for m in concat hls mov rtsp; do
+            echo "$DMX" | grep -qE "^ D[E ][d ] ([A-Za-z0-9_]+,)*$m(,[A-Za-z0-9_]+)* " || { echo "::error::falta el formato de entrada $m"; exit 1; }
+          done
+          PROTO="$(ff -protocols | tr -d '\r')"
+          for p in file pipe http https tls tcp udp crypto; do
+            echo "$PROTO" | grep -qE "^  $p\$" || { echo "::error::falta el protocolo $p"; exit 1; }
+          done
+          # awk lee todo (con pipefail, un `head -1` que corta el pipe puede dar error).
+          V1="$(ff -version | awk 'NR == 1 {print $3}')"
+          V2="$(fp -version | awk 'NR == 1 {print $3}')"
+          [ "$V1" = "$V2" ] || { echo "::error::ffprobe $V2 != ffmpeg $V1"; exit 1; }
+          [ "$V1" = "$FFMPEG_VERSION" ] || { echo "::error::ffmpeg dice $V1, se pidió $FFMPEG_VERSION"; exit 1; }
+
+          # Codificaciones de prueba de 2 segundos. OpenH264 tiene que andar
+          # siempre; Media Foundation necesita el codificador H.264 de Windows
+          # (msmpeg2venc.dll), que una edición Server puede no traer: si no está,
+          # solo avisa; si está y falla, es un error.
+          SRC=(-f lavfi -i testsrc2=d=2:s=320x180:r=25 -f lavfi -i sine=d=2)
+          ff -loglevel error "${SRC[@]}" -c:v libopenh264 -c:a aac -shortest -y prueba-openh264.mp4
+          fp -v error -show_streams -of json prueba-openh264.mp4 > prueba-openh264.json
+          grep -q '"codec_name": "h264"' prueba-openh264.json || { echo '::error::ffprobe no ve H.264 en la prueba de libopenh264'; exit 1; }
+          grep -q '"codec_name": "aac"' prueba-openh264.json || { echo '::error::ffprobe no ve AAC en la prueba'; exit 1; }
+          if ff -loglevel error "${SRC[@]}" -c:v h264_mf -c:a aac -shortest -y prueba-mf.mp4; then
+            fp -v error -show_entries stream=codec_name -of csv=p=0 prueba-mf.mp4
+          elif [ -f /c/Windows/System32/msmpeg2venc.dll ]; then
+            echo '::error::h264_mf falló con el codificador de Windows presente'; exit 1
+          else
+            echo '::warning::el runner no tiene el codificador H.264 de Media Foundation; probar h264_mf en un Windows real'
+          fi
+
+      - name: Bajar el código fuente de las bibliotecas
+        run: |
+          set -euo pipefail
+          W="$(cygpath -u "$GITHUB_WORKSPACE")"
+          SRCDIR="$W/sources"
+          mkdir -p "$SRCDIR"
+          cp "src/ffmpeg-${FFMPEG_VERSION}.tar.xz" "src/ffmpeg-${FFMPEG_VERSION}.tar.xz.asc" "$SRCDIR/"
+          : > "$W/data/sources.tsv"
+          # Versión de pacman sin época ni pkgrel (1.5.1-1 → 1.5.1).
+          upver() { pacman -Q "$1" | awk '{print $2}' | sed -E 's/^[0-9]+://; s/-[0-9.]+$//'; }
+          fullver() { pacman -Q "$1" | awk '{print $2}'; }
+          # Intenta la URL de upstream; si falla, el paquete fuente de MSYS2 (trae
+          # el mismo tarball de upstream más el PKGBUILD y los parches).
+          fetch() {
+            local short="$1" file="$2" url="$3"
+            local pkg="mingw-w64-x86_64-$short"
+            local msys="mingw-w64-$short-$(fullver "$pkg").src.tar.zst"
+            if curl -fsSL -o "$SRCDIR/$file" "$url"; then
+              echo -e "$pkg\t$file\t$url" >> "$W/data/sources.tsv"
+            elif curl -fsSL -o "$SRCDIR/$msys" "https://repo.msys2.org/mingw/sources/$msys"; then
+              echo "::warning::$short: no se pudo bajar $url; va el paquete fuente de MSYS2"
+              echo -e "$pkg\t$msys\thttps://repo.msys2.org/mingw/sources/$msys" >> "$W/data/sources.tsv"
+            else
+              echo "::error::no se pudo bajar el código fuente de $short"; exit 1
+            fi
+          }
+          v="$(upver mingw-w64-x86_64-dav1d)"
+          fetch dav1d "dav1d-$v.tar.xz" "https://downloads.videolan.org/pub/videolan/dav1d/$v/dav1d-$v.tar.xz"
+          v="$(upver mingw-w64-x86_64-openh264)"
+          fetch openh264 "openh264-$v.tar.gz" "https://github.com/cisco/openh264/archive/refs/tags/v$v.tar.gz"
+          v="$(upver mingw-w64-x86_64-libvpl)"
+          fetch libvpl "libvpl-$v.tar.gz" "https://github.com/intel/libvpl/archive/refs/tags/v$v.tar.gz"
+          v="$(upver mingw-w64-x86_64-zlib)"
+          fetch zlib "zlib-$v.tar.gz" "https://github.com/madler/zlib/releases/download/v$v/zlib-$v.tar.gz"
+          (cd "$SRCDIR" && sha256sum * | tee "$W/data/sources.sha256")
+
+      - name: version.json y SOURCES.md
+        shell: python
+        run: |
+          import datetime, json, os, re
+          from pathlib import Path
+
+          W = Path(os.environ['GITHUB_WORKSPACE'])
+          DATA = W / 'data'
+          V = os.environ['FFMPEG_VERSION']
+          NAME = os.environ['NAME']
+          STAGE = W / 'stage' / NAME
+          DIST = W / 'dist'
+          REPO = 'https://github.com/nacholiporace/goal-labs-ffmpeg'
+          TAG = f'ffmpeg-{V}'
+          ASSET = f'{NAME}.zip'
+          ENC_RE = re.compile(r'^ [VAS][.F][.S][.X][.B][.D] (\w\S*)')
+
+          version_txt = (DATA / 'version.txt').read_text(encoding='utf-8')
+          version = re.search(r'^ffmpeg version (\S+)', version_txt, re.M).group(1)
+          configuration = re.search(r'^configuration: (.*)$', version_txt, re.M).group(1).strip()
+          v3 = '--enable-version3' in configuration.split()
+          license_id = 'LGPL-3.0-or-later' if v3 else 'LGPL-2.1-or-later'
+          encoders = [m.group(1) for l in (DATA / 'encoders.txt').read_text(encoding='utf-8').splitlines() if (m := ENC_RE.match(l))]
+
+          def pkginfo(pkg):
+              info = {}
+              for line in (DATA / 'pkginfo' / f'{pkg}.txt').read_text(encoding='utf-8').splitlines():
+                  m = re.match(r'^([A-Za-z ]+?)\s*: (.*)$', line)
+                  if m:
+                      info[m.group(1)] = m.group(2).strip()
+              return info
+
+          dlls = [l.split('\t') for l in (DATA / 'dlls.tsv').read_text(encoding='utf-8').splitlines() if l.strip()]
+          ffmpeg_dlls = sorted(d for d, p in dlls if p == 'ffmpeg')
+          # Bibliotecas de ejecución del compilador (GCC y winpthreads); el resto, externas.
+          RUNTIME = re.compile(r'^mingw-w64-x86_64-(gcc-libs|libwinpthread.*|winpthreads.*)$')
+          runtime_dlls = sorted(d for d, p in dlls if p != 'ffmpeg' and RUNTIME.match(p))
+          external_dlls = sorted(d for d, p in dlls if p != 'ffmpeg' and not RUNTIME.match(p))
+          binaries = ['ffmpeg.exe', 'ffprobe.exe']
+          files = binaries + ffmpeg_dlls + external_dlls + runtime_dlls
+
+          sources = {}
+          for l in (DATA / 'sources.tsv').read_text(encoding='utf-8').splitlines():
+              if l.strip():
+                  pkg, file, url = l.split('\t')
+                  sources[pkg] = (file, url)
+          packages = [p for p in (DATA / 'packages.txt').read_text(encoding='utf-8').split() if p]
+          libs = []
+          for pkg in packages:
+              info = pkginfo(pkg)
+              libs.append({
+                  'package': pkg,
+                  'version': info.get('Version'),
+                  'license': info.get('Licenses'),
+                  'url': info.get('URL'),
+                  'dlls': sorted(d for d, p in dlls if p == pkg),
+                  'kind': 'runtime' if RUNTIME.match(pkg) else 'external',
+                  'source': sources.get(pkg, (None, None))[0],
+              })
+
+          run_url = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          version_json = {
+              'platform': 'win32-x64',
+              'pinnedVersion': V,
+              'version': version,
+              'license': license_id,
+              'source': {'tag': TAG, 'asset': ASSET, 'url': f'{REPO}/releases/download/{TAG}/{ASSET}'},
+              # El SHA-256 del zip no puede ir adentro del zip: está en el .sha256
+              # y scripts/fetchFfmpeg.mjs lo escribe al instalarlo.
+              'sha256': None,
+              'files': files,
+              'configuration': configuration,
+              'requiredEncoders': ['h264_nvenc', 'h264_qsv', 'h264_amf', 'h264_mf', 'libopenh264', 'aac'],
+              'encoders': encoders,
+              'libraries': {'ffmpeg': ffmpeg_dlls, 'external': external_dlls, 'runtime': runtime_dlls},
+              # Fase 4: se firman los dos .exe y TODAS las DLL, también las de MinGW.
+              'toSign': files,
+              'externalLibraries': libs,
+              'compiler': (DATA / 'gcc.txt').read_text(encoding='utf-8').strip(),
+              'buildRun': run_url,
+              'builtAt': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+          }
+          (STAGE / 'version.json').write_text(json.dumps(version_json, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+
+          src_sha = {}
+          for l in (DATA / 'sources.sha256').read_text(encoding='utf-8').splitlines():
+              h, f = l.split(maxsplit=1)
+              src_sha[f.lstrip('*')] = h
+          out = [
+              f'# FFmpeg {version} para Goal Labs (Windows x64, {license_id})', '',
+              f'Compilado por `.github/workflows/ffmpeg-windows.yml` ({run_url}) con MSYS2 MINGW64, {version_json["compiler"]}.',
+              f'Código fuente de todo lo que viaja en este build: `{NAME.replace("lgpl-shared", "sources")}.zip`, en el mismo release de {REPO}.', '',
+              '## FFmpeg', '',
+              f'- Tarball oficial: https://ffmpeg.org/releases/ffmpeg-{V}.tar.xz (firma `.asc` verificada con https://ffmpeg.org/ffmpeg-devel.asc)',
+              f'- SHA-256: `{src_sha.get(f"ffmpeg-{V}.tar.xz", "?")}`',
+              f'- Licencia: {license_id} (`ffmpeg -L`). Sin `--enable-gpl`, `--enable-nonfree` ni `--enable-version3`.',
+              f'- Configuración: `{configuration}`', '',
+              '## Bibliotecas externas y de ejecución', '',
+              '| Paquete de MSYS2 | Versión | Licencia (pacman) | DLL | Proyecto | Código fuente en el zip |',
+              '|---|---|---|---|---|---|',
+          ]
+          for x in libs:
+              src = f"`{x['source']}` (SHA-256 `{src_sha.get(x['source'], '?')}`)" if x['source'] else \
+                  ('no hace falta: excepción de bibliotecas de ejecución de GCC / MIT; fuente en el proyecto' if x['kind'] == 'runtime'
+                   else 'encabezados MIT, fuente en el proyecto')
+              out.append(f"| {x['package']} | {x['version']} | {x['license']} | {', '.join(x['dlls']) or '(compilado adentro)'} | {x['url']} | {src} |")
+          out += ['', 'Los textos de licencia que trae cada paquete están en `licenses/<paquete>/`.',
+                  'libgcc_s_seh y libstdc++ son GPL-3.0-or-later con la GCC Runtime Library Exception 3.1, que permite distribuirlas con programas de cualquier licencia.', '',
+                  '## Detalle de pacman (`pacman -Qi`)', '']
+          for pkg in packages:
+              out += [f'### {pkg}', '', '```', (DATA / 'pkginfo' / f'{pkg}.txt').read_text(encoding='utf-8').strip(), '```', '']
+          (STAGE / 'SOURCES.md').write_text('\n'.join(out), encoding='utf-8')
+          print(json.dumps(version_json, indent=2, ensure_ascii=False))
+
+      - name: Empaquetar
+        run: |
+          set -euo pipefail
+          W="$(cygpath -u "$GITHUB_WORKSPACE")"
+          STAGE="$W/stage/$NAME"
+          SRCNAME="ffmpeg-${FFMPEG_VERSION}-win64-sources"
+          mkdir -p "$W/out"
+          cp "$W"/dist/* "$STAGE/"
+          # La licencia de FFmpeg que corresponde al build (LGPL 2.1; v3 si algún día lleva version3).
+          if grep -q -- '--enable-version3' "$W/data/version.txt"; then LIC=COPYING.LGPLv3; else LIC=COPYING.LGPLv2.1; fi
+          cp "src/ffmpeg-${FFMPEG_VERSION}/$LIC" "$STAGE/LICENSE.txt"
+          cp "src/ffmpeg-${FFMPEG_VERSION}/LICENSE.md" "$STAGE/licenses/ffmpeg-LICENSE.md"
+          (cd "$W/stage" && zip -r -9 -q "$W/out/$NAME.zip" "$NAME")
+          (cd "$W/out" && sha256sum "$NAME.zip" | tee "$NAME.zip.sha256")
+          cp "$STAGE/SOURCES.md" "$W/sources/"
+          (cd "$W" && zip -r -0 -q "$W/out/$SRCNAME.zip" sources)
+          (cd "$W/out" && sha256sum "$SRCNAME.zip")
+          unzip -l "$W/out/$NAME.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-${{ inputs.ffmpeg_version }}-win64-lgpl-shared
+          path: out/
+          if-no-files-found: error
+          retention-days: 90
