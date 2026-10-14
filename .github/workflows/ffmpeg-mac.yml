@@ -86,10 +86,13 @@ jobs:
           set -euo pipefail
           # --disable-autodetect: que no tome nada del runner; se prende a mano
           # solo lo que viene con macOS y dav1d, que se compiló en el paso anterior.
+          # En macOS iconv está en /usr/lib/libiconv, aparte de libSystem, y
+          # configure no lo suma solo: sin -liconv el enlace falla.
           PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" ./configure \
             --prefix="$PREFIX" \
             --arch=arm64 --cc=clang \
             --pkg-config-flags=--static \
+            --extra-libs=-liconv \
             --disable-gpl --disable-nonfree \
             --disable-shared --enable-static \
             --disable-doc --disable-debug --disable-ffplay \
