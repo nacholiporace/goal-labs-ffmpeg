@@ -1,0 +1,226 @@
+# FFmpeg LGPL para Goal Labs en Mac con Apple Silicon.
+#
+# Se compila en este repositorio público para que el build quede a la vista:
+# cada binario de Mac publicado en los releases sale de una corrida de este
+# workflow, con su log. Se corre a mano (Actions → "FFmpeg Mac (LGPL)" → Run
+# workflow) y no publica nada: deja un artifact que se revisa y se sube al
+# release a mano.
+#
+# Qué lleva:
+#   - FFmpeg desde el tarball oficial de ffmpeg.org, con la firma verificada.
+#     --disable-gpl --disable-nonfree, sin --enable-version3: LGPL 2.1 o posterior.
+#   - libdav1d (BSD-2), estática, para decodificar AV1. La misma versión que
+#     el build de Windows; el tarball se verifica contra su SHA-256.
+#   - Del sistema: VideoToolbox (H.264 por hardware, y por software con
+#     -allow_sw 1), AudioToolbox, AVFoundation (cámara y capturadora en vivo),
+#     Secure Transport, zlib, bzip2 e iconv.
+#   - Nada de Homebrew en el binario: Homebrew solo aporta herramientas de
+#     compilación (meson, ninja, pkgconf, gnupg).
+#
+# Después de correrlo:
+# 1. Bajar el artifact `ffmpeg-<versión>-darwin-arm64`.
+# 2. Subir al release `ffmpeg-<versión>`:
+#      gh release upload ffmpeg-<versión> --repo nacholiporace/goal-labs-ffmpeg \
+#        ffmpeg-<versión>-darwin-arm64.tar.gz ffmpeg-<versión>-darwin-arm64.tar.gz.sha256 \
+#        ffmpeg-<versión>-darwin-arm64-sources.tar.gz
+# 3. En el repo de Goal Labs, scripts/fetchFfmpeg.mjs, PINNED['darwin-arm64']:
+#    `tag`, `url` y `sha256` (el del .sha256), y `licenseDir: 'licenses'`.
+#
+# La versión tiene que ser la misma que FFMPEG_VERSION de scripts/fetchFfmpeg.mjs.
+name: FFmpeg Mac (LGPL)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Versión de FFmpeg (la misma que FFMPEG_VERSION en scripts/fetchFfmpeg.mjs de Goal Labs)
+        required: true
+        default: '9.0.2'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      FFMPEG_VERSION: ${{ inputs.version }}
+      DAV1D_VERSION: '1.5.4'
+      DAV1D_SHA256: '686616b7c69eb88d44459391ab25cac13b6647a3b288835c5784e71c1514a5c5'
+      # El binario corre desde macOS 12. Goal Labs pide 13 por OpenCV; FFmpeg
+      # no es el límite.
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+    steps:
+      - name: Herramientas de compilación
+        run: |
+          set -euo pipefail
+          brew install meson ninja pkgconf gnupg
+          echo "PREFIX=$GITHUB_WORKSPACE/prefix" >> "$GITHUB_ENV"
+
+      - name: Bajar el código fuente y verificarlo
+        run: |
+          set -euo pipefail
+          mkdir -p src && cd src
+          curl -fsSLO "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
+          curl -fsSLO "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz.asc"
+          curl -fsSL https://ffmpeg.org/ffmpeg-devel.asc | gpg --import
+          gpg --verify "ffmpeg-${FFMPEG_VERSION}.tar.xz.asc" "ffmpeg-${FFMPEG_VERSION}.tar.xz"
+          curl -fsSLO "https://downloads.videolan.org/pub/videolan/dav1d/${DAV1D_VERSION}/dav1d-${DAV1D_VERSION}.tar.xz"
+          echo "${DAV1D_SHA256}  dav1d-${DAV1D_VERSION}.tar.xz" | shasum -a 256 -c -
+          cd ..
+          tar -xf "src/ffmpeg-${FFMPEG_VERSION}.tar.xz"
+          tar -xf "src/dav1d-${DAV1D_VERSION}.tar.xz"
+
+      - name: Compilar libdav1d (estática)
+        working-directory: dav1d-${{ env.DAV1D_VERSION }}
+        run: |
+          set -euo pipefail
+          meson setup build --prefix="$PREFIX" --libdir=lib --buildtype=release \
+            --default-library=static -Denable_tools=false -Denable_tests=false
+          ninja -C build install
+
+      - name: Compilar FFmpeg (LGPL, estático)
+        working-directory: ffmpeg-${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # --disable-autodetect: que no tome nada del runner; se prende a mano
+          # solo lo que viene con macOS y dav1d, que se compiló en el paso anterior.
+          PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" ./configure \
+            --prefix="$PREFIX" \
+            --arch=arm64 --cc=clang \
+            --pkg-config-flags=--static \
+            --disable-gpl --disable-nonfree \
+            --disable-shared --enable-static \
+            --disable-doc --disable-debug --disable-ffplay \
+            --disable-autodetect \
+            --enable-videotoolbox --enable-audiotoolbox \
+            --enable-avfoundation --enable-securetransport \
+            --enable-zlib --enable-bzlib --enable-iconv \
+            --enable-libdav1d
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+
+      - name: Verificar
+        run: |
+          set -euo pipefail
+          BIN="$PREFIX/bin"
+          ff() { "$BIN/ffmpeg" -hide_banner "$@"; }
+          fp() { "$BIN/ffprobe" -hide_banner "$@"; }
+          # Todo a archivos y grep sobre el archivo: con pipefail, un grep -q o
+          # un head que corta el pipe puede dar un error falso.
+          mkdir -p check
+          ff -version > check/version.txt; cat check/version.txt
+          for flag in --enable-gpl --enable-nonfree --enable-version3 --enable-libx264 --enable-libx265; do
+            if grep -q -- "$flag" check/version.txt; then echo "::error::la configuración tiene $flag"; exit 1; fi
+          done
+          ff -L > check/license.txt
+          tr '\n' ' ' < check/license.txt > check/license-1linea.txt
+          grep -q 'GNU Lesser General Public License' check/license-1linea.txt || { echo '::error::ffmpeg -L no dice LGPL'; exit 1; }
+          grep -q 'version 2.1 of the License' check/license.txt || { echo '::error::ffmpeg -L no dice LGPL 2.1'; exit 1; }
+
+          # Lo mismo que pide Goal Labs en Windows, con VideoToolbox en lugar de
+          # la placa y AVFoundation en lugar de DirectShow.
+          ff -encoders > check/encoders.txt
+          for e in h264_videotoolbox aac; do
+            grep -qE "^ [VAS][.F][.S][.X][.B][.D] $e " check/encoders.txt || { echo "::error::falta el codificador $e"; exit 1; }
+          done
+          if grep -qE ' libx26[45] ' check/encoders.txt; then echo '::error::trae libx264/libx265'; exit 1; fi
+          ff -decoders > check/decoders.txt
+          for d in h264 hevc vp9 mpeg4 mjpeg png aac libdav1d; do
+            grep -qE "^ [VAS][.F][.S][.X][.B][.D] $d " check/decoders.txt || { echo "::error::falta el decodificador $d"; exit 1; }
+          done
+          ff -devices > check/devices.txt
+          for d in avfoundation lavfi; do
+            grep -qE "^ [D ][E ] $d " check/devices.txt || { echo "::error::falta el dispositivo $d"; exit 1; }
+          done
+          ff -filters > check/filters.txt
+          for f in scale crop overlay concat fps format setpts setsar trim pad split null select showinfo                    highpass color anullsrc testsrc2 sine ssim psnr gblur; do
+            grep -qE "^ [T.][S.] $f " check/filters.txt || { echo "::error::falta el filtro $f"; exit 1; }
+          done
+          ff -muxers > check/muxers.txt
+          for m in mp4 mov hls segment tee f32le null; do
+            grep -qE "^ [D ]E[d ] ([A-Za-z0-9_]+,)*$m(,[A-Za-z0-9_]+)* " check/muxers.txt || { echo "::error::falta el formato de salida $m"; exit 1; }
+          done
+          ff -demuxers > check/demuxers.txt
+          for m in concat hls mov rtsp; do
+            grep -qE "^ D[E ][d ] ([A-Za-z0-9_]+,)*$m(,[A-Za-z0-9_]+)* " check/demuxers.txt || { echo "::error::falta el formato de entrada $m"; exit 1; }
+          done
+          ff -protocols > check/protocols.txt
+          for p in file pipe http https tls tcp udp crypto; do
+            grep -qE "^  $p\$" check/protocols.txt || { echo "::error::falta el protocolo $p"; exit 1; }
+          done
+
+          V1="$(ff -version | awk 'NR == 1 {print $3}')"
+          V2="$(fp -version | awk 'NR == 1 {print $3}')"
+          [ "$V1" = "$V2" ] || { echo "::error::ffprobe $V2 != ffmpeg $V1"; exit 1; }
+          for b in ffmpeg ffprobe; do
+            file "$BIN/$b" > check/file.txt
+            grep -q arm64 check/file.txt || { echo "::error::$b no es arm64"; exit 1; }
+            # Solo bibliotecas del sistema: nada de /opt/homebrew ni /usr/local.
+            otool -L "$BIN/$b" | awk 'NR > 1 {print $1}' > check/libs.txt
+            cat check/libs.txt
+            if grep -vE '^(/usr/lib/|/System/Library/)' check/libs.txt; then
+              echo "::error::$b enlaza bibliotecas fuera del sistema"; exit 1
+            fi
+            # Mínimo de macOS que pide el binario.
+            MINOS="$(otool -l "$BIN/$b" | awk '/LC_BUILD_VERSION/ {f = 1} f && $1 == "minos" && !m {m = $2} END {print m}')"
+            echo "$b: macOS mínimo $MINOS"
+            [ "$MINOS" = "$MACOSX_DEPLOYMENT_TARGET" ] || { echo "::error::$b pide macOS $MINOS"; exit 1; }
+          done
+
+          # Codificación de prueba. La máquina virtual del runner puede no tener
+          # VideoToolbox por hardware: ahí solo avisa. Con -allow_sw 1 tiene que
+          # andar siempre: es el respaldo de Goal Labs si falla el hardware.
+          SRC=(-f lavfi -i testsrc2=d=2:s=320x180:r=25 -f lavfi -i sine=d=2)
+          if ff -loglevel error "${SRC[@]}" -c:v h264_videotoolbox -c:a aac -shortest -y prueba-hw.mp4; then
+            echo 'VideoToolbox por hardware: ok'
+          else
+            echo '::warning::h264_videotoolbox por hardware no codificó en el runner; probarlo en una Mac real'
+          fi
+          ff -loglevel error "${SRC[@]}" -c:v h264_videotoolbox -allow_sw 1 -c:a aac -shortest -y prueba-sw.mp4
+          fp -v error -show_entries stream=codec_name -of csv=p=0 prueba-sw.mp4 > check/prueba-sw.txt
+          cat check/prueba-sw.txt
+          grep -qx h264 check/prueba-sw.txt || { echo '::error::-allow_sw 1 no produjo H.264'; exit 1; }
+          grep -qx aac check/prueba-sw.txt || { echo '::error::la prueba no tiene AAC'; exit 1; }
+
+      - name: Empaquetar
+        run: |
+          set -euo pipefail
+          NAME="ffmpeg-${FFMPEG_VERSION}-darwin-arm64"
+          FF="ffmpeg-${FFMPEG_VERSION}"
+          DV="dav1d-${DAV1D_VERSION}"
+          mkdir -p stage/licenses/dav1d out sources
+          cp "$PREFIX/bin/ffmpeg" "$PREFIX/bin/ffprobe" stage/
+          cp "$FF/LICENSE.md" "$FF/COPYING.LGPLv2.1" stage/
+          cp "$FF/LICENSE.md" stage/licenses/ffmpeg-LICENSE.md
+          cp "$DV/COPYING" "$DV/doc/PATENTS" stage/licenses/dav1d/
+          CONFIG="$("$PREFIX/bin/ffmpeg" -hide_banner -buildconf | sed -n 's/^ *//p' | grep '^--' | tr '\n' ' ')"
+          {
+            echo "# Código fuente de ${NAME}"
+            echo
+            echo "Compilado por .github/workflows/ffmpeg-mac.yml de github.com/nacholiporace/goal-labs-ffmpeg"
+            echo "(corrida ${GITHUB_RUN_ID}: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})."
+            echo
+            echo "- Configuración: \`${CONFIG}\`"
+            echo "- Mínimo: macOS ${MACOSX_DEPLOYMENT_TARGET}, arm64."
+            echo
+            echo "| Biblioteca | Versión | Licencia | Proyecto | Código fuente |"
+            echo "|---|---|---|---|---|"
+            echo "| FFmpeg | ${FFMPEG_VERSION} | LGPL-2.1-or-later | https://ffmpeg.org | \`${FF}.tar.xz\` con su firma \`${FF}.tar.xz.asc\` |"
+            echo "| dav1d | ${DAV1D_VERSION} | BSD-2-Clause | https://code.videolan.org/videolan/dav1d | \`${DV}.tar.xz\` (SHA-256 \`${DAV1D_SHA256}\`) |"
+            echo
+            echo "Del sistema (no se distribuyen): VideoToolbox, AudioToolbox, AVFoundation, Security, CoreFoundation, libz, libbz2, libiconv."
+          } > stage/SOURCES.md
+          tar -czf "out/${NAME}.tar.gz" -C stage .
+          (cd out && shasum -a 256 "${NAME}.tar.gz" | tee "${NAME}.tar.gz.sha256")
+          cp "src/${FF}.tar.xz" "src/${FF}.tar.xz.asc" "src/${DV}.tar.xz" stage/SOURCES.md sources/
+          tar -czf "out/${NAME}-sources.tar.gz" -C sources .
+          ls -la out stage stage/licenses/dav1d
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-${{ inputs.version }}-darwin-arm64
+          path: out/
+          if-no-files-found: error
+          retention-days: 90
